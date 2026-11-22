@@ -1,0 +1,8 @@
+# Used only by the workflow ot-as-dependency.yml (variant B). Variant A ignores this file.
+# This package has no code of its own: it exists to require Tau Ceti at one pinned commit.
+name = "TauCetiOTBuildCheck"
+
+[[require]]
+name = "TauCeti"
+git = "https://github.com/TauCetiProject/TauCeti"
+rev = "aa1b4e9e2a25944efe7815c1898fb9fd5e879c11"

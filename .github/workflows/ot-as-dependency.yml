@@ -1,0 +1,107 @@
+# Variant B: this repository is a Lake package that requires Tau Ceti at a pinned commit
+# (lakefile.toml). Lake resolves Tau Ceti and its dependencies, Mathlib's prebuilt files come from
+# Mathlib's cache, and every module of TauCeti/MeasureTheory/OptimalTransport is built as a module
+# of the dependency (and, through Lake, the Tau Ceti modules they import), from source.
+#
+# Open point checked by the job itself: which Mathlib revision Lake selects for the transitive
+# dependency. The job stops if it is not the revision pinned by Tau Ceti's own manifest.
+#
+# This file has never been run. Each step names its source in README.md, "Sources".
+name: ot-as-dependency
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_minutes:
+        description: "Time limit for the lake build step, in minutes (the job itself stops at 355)"
+        required: false
+        default: "300"
+
+permissions:
+  contents: read
+
+env:
+  TAUCETI_REPO: TauCetiProject/TauCeti
+  TAUCETI_REV: aa1b4e9e2a25944efe7815c1898fb9fd5e879c11
+  LEAN_TOOLCHAIN: leanprover/lean4:v4.37.0-rc1
+  MATHLIB_REV: 31ce06eaadf4a200c0e1407c5f10953cf606b8f8
+  ELAN_VERSION: v4.2.3
+  ELAN_SHA256: df0b2b3a439961ffcbb3985214365ffe40f49bc871df04dff268c7d8e21ca8b2
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # GitHub-hosted jobs are limited to 6 hours (360 minutes); stop a little earlier.
+    timeout-minutes: 355
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare the report directory and record the machine
+        run: |
+          echo "REPORT_DIR=$RUNNER_TEMP/ot-report" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ot-report"
+          bash ci/runner-info.sh "$RUNNER_TEMP/ot-report/runner.txt"
+
+      - name: Check the toolchain pin of this package
+        run: |
+          python3 ci/check_pins.py --toolchain-file lean-toolchain --expect-toolchain "$LEAN_TOOLCHAIN" \
+            | tee "$REPORT_DIR/pins.txt"
+
+      - name: Raise vm.max_map_count (as Tau Ceti's own CI does)
+        run: |
+          sudo -n sysctl -w vm.max_map_count=1048576 || echo "::warning::could not raise vm.max_map_count"
+          cat /proc/sys/vm/max_map_count
+
+      - name: Install elan (pinned, checksum verified) and the toolchain
+        run: bash ci/timed.sh install-elan bash ci/install-elan.sh
+
+      - name: Resolve dependencies and fetch Mathlib's prebuilt files
+        # No lake-manifest.json is committed: Lake resolves the dependencies on this first command.
+        run: |
+          bash ci/timed.sh cache-get bash -c 'lake exe cache get || lake exe cache get!'
+          df -Pk . | tee "$REPORT_DIR/disk-after-cache.txt"
+
+      - name: Check the resolved pins (Tau Ceti commit, Mathlib revision, toolchain of the dependency)
+        run: |
+          cp lake-manifest.json "$REPORT_DIR/lake-manifest.resolved.json"
+          python3 ci/check_pins.py \
+            --toolchain-file .lake/packages/TauCeti/lean-toolchain --expect-toolchain "$LEAN_TOOLCHAIN" \
+            --manifest lake-manifest.json \
+            --expect-package "TauCeti=$TAUCETI_REV" --expect-package "mathlib=$MATHLIB_REV" \
+            | tee -a "$REPORT_DIR/pins.txt"
+
+      - name: List the modules of the optimal transport layer
+        run: bash ci/list-targets.sh .lake/packages/TauCeti "@TauCeti/" "$REPORT_DIR/targets.txt"
+
+      - name: Build the layer from source
+        # The step limit is a second guard; build.sh stops lake build itself at build_minutes.
+        timeout-minutes: 340
+        env:
+          BUILD_MINUTES: ${{ inputs.build_minutes || '300' }}
+        run: |
+          case "$BUILD_MINUTES" in (''|*[!0-9]*) echo "build_minutes must be an integer"; exit 1;; esac
+          bash ci/timed.sh lake-build \
+            bash ci/build.sh . "$REPORT_DIR/targets.txt" "$BUILD_MINUTES" "$REPORT_DIR"
+
+      - name: Write the report
+        if: ${{ !cancelled() }}
+        run: bash ci/report.sh "$REPORT_DIR" . ot-as-dependency
+
+      - name: Upload the report and the build log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ot-build-report-as-dependency
+          path: ${{ runner.temp }}/ot-report
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fail the job if the build failed
+        if: ${{ !cancelled() }}
+        run: |
+          code="$(grep -m1 '^exit_code=' "$REPORT_DIR/build-status.txt" | cut -d= -f2)"
+          echo "lake build exit code: ${code:-missing}"
+          test "${code:-1}" = "0"
